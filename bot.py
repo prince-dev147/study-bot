@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -6,10 +7,30 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
+from google import genai
+from google.genai import errors, types
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 DB_FILE = "bot.db"
+
+# Preferred model first, then backups (duplicates removed, order kept)
+MODEL_CHAIN = list(
+    dict.fromkeys(
+        [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash"]
+    )
+)
+
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+EXPLAIN_INSTRUCTIONS = (
+    "You are a friendly coding tutor for beginners. Explain the code the user "
+    "sends in plain English: first one sentence on what it does overall, then a "
+    "short step-by-step walkthrough. If you spot a bug or bad practice, mention "
+    "it briefly. Keep the whole answer under 1500 characters."
+)
 
 
 def init_db():
@@ -28,6 +49,35 @@ def init_db():
     )
     conn.commit()
     conn.close()
+
+
+async def ask_gemini(code):
+    """Ask Gemini to explain the code. Tries each model, retrying on busy errors.
+
+    Returns the explanation text, or None if every model failed.
+    """
+    for model in MODEL_CHAIN:
+        for attempt in range(2):
+            try:
+                response = await ai_client.aio.models.generate_content(
+                    model=model,
+                    contents=f"Explain this code:\n\n{code}",
+                    config=types.GenerateContentConfig(
+                        system_instruction=EXPLAIN_INSTRUCTIONS
+                    ),
+                )
+                if response.text:
+                    return response.text
+                break  # empty answer: try the next model
+            except errors.ServerError as error:
+                print(f"[WARN] {model} busy ({error.code}), attempt {attempt + 1}")
+                await asyncio.sleep(2)
+            except errors.ClientError as error:
+                print(f"[WARN] {model} failed ({error.code})")
+                if error.code in (404, 429):
+                    break  # model gone or quota hit: try the next model
+                raise
+    return None
 
 
 class StudyBot(discord.Client):
@@ -72,6 +122,23 @@ class StudyBot(discord.Client):
 bot = StudyBot()
 
 
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    """Handle command errors, like the /explain cooldown."""
+    if isinstance(error, app_commands.CommandOnCooldown):
+        message = f"Slow down! Try again in {error.retry_after:.0f} seconds."
+    else:
+        print(f"[ERROR] Command error: {error}")
+        message = "Something went wrong. Please try again."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
 @bot.tree.command(name="ping", description="Check that the bot is alive")
 async def ping(interaction: discord.Interaction):
     await interaction.response.defer()  # tell Discord "working on it" right away
@@ -104,6 +171,35 @@ async def remind(
     await interaction.followup.send(
         f"Got it! I'll remind you in {minutes} minute(s): {message}"
     )
+
+
+@bot.tree.command(name="explain", description="Explain a piece of code in plain English")
+@app_commands.describe(code="The code you want explained")
+@app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
+async def explain(
+    interaction: discord.Interaction,
+    code: app_commands.Range[str, 1, 3000],
+):
+    await interaction.response.defer()  # the AI call can take several seconds
+
+    if ai_client is None:
+        await interaction.followup.send("GEMINI_API_KEY is missing in my .env file.")
+        return
+
+    try:
+        answer = await ask_gemini(code)
+    except Exception as error:
+        print(f"[ERROR] /explain failed: {error}")
+        answer = None
+
+    if answer is None:
+        await interaction.followup.send(
+            "Sorry, the AI is busy right now. Please try again in a minute."
+        )
+        return
+
+    # Discord messages are limited to 2000 characters
+    await interaction.followup.send(answer[:1900])
 
 
 if __name__ == "__main__":
