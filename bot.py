@@ -74,7 +74,9 @@ bot = StudyBot()
 
 @bot.tree.command(name="ping", description="Check that the bot is alive")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
+    await interaction.response.defer()  # tell Discord "working on it" right away
+    latency_ms = round(bot.latency * 1000)
+    await interaction.followup.send(f"Pong! Latency: {latency_ms} ms")
 
 
 @bot.tree.command(name="remind", description="Set a study reminder")
@@ -87,6 +89,8 @@ async def remind(
     minutes: app_commands.Range[int, 1, 10080],
     message: str,
 ):
+    await interaction.response.defer()
+
     remind_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
     conn = sqlite3.connect(DB_FILE)
@@ -97,7 +101,7 @@ async def remind(
     conn.commit()
     conn.close()
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Got it! I'll remind you in {minutes} minute(s): {message}"
     )
 
