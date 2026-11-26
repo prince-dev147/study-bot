@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import discord
+from aiohttp import web
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+PORT = int(os.getenv("PORT", "3000"))
 DB_FILE = "bot.db"
 
 # Preferred model first, then backups (duplicates removed, order kept)
@@ -51,6 +53,23 @@ def init_db():
     conn.close()
 
 
+async def start_web_server():
+    """Open a tiny web page so hosts that check a port see the app as healthy."""
+
+    async def handle(request):
+        return web.Response(text="StudyBot is running")
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"Health server listening on port {PORT}")
+
+
 async def ask_gemini(code):
     """Ask Gemini to explain the code. Tries each model, retrying on busy errors.
 
@@ -86,6 +105,7 @@ class StudyBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        await start_web_server()  # open the port first so health checks pass
         init_db()
         await self.tree.sync()  # registers the slash commands with Discord
         self.check_reminders.start()
